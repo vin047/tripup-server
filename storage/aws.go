@@ -1,26 +1,33 @@
 package storage
 
 import (
+	"errors"
+	URL "net/url"
+	"os"
+	"strings"
+
 	"github.com/aws/aws-sdk-go/aws"
-    "errors"
-    "strings"
-    URL "net/url"
-    "github.com/aws/aws-sdk-go/aws/session"
-    "github.com/aws/aws-sdk-go/service/s3"
+	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/s3"
 )
 
-type s3storage struct {
-    session *session.Session
+type s3Backend struct {
+    s3Session *session.Session
 }
 
-func NewS3Backend() *s3storage {
-    return &s3storage{
-        session: session.Must(session.NewSessionWithOptions(session.Options{
+func NewS3Backend() *s3Backend {
+    endpoint := os.Getenv("AWS_ENDPOINT")
+    return &s3Backend{
+        s3Session: session.Must(session.NewSessionWithOptions(session.Options{
+            Config: aws.Config{
+                Endpoint: &endpoint,
+            },
             SharedConfigState: session.SharedConfigEnable,
         }))}
 }
 
-func (*s3storage) Filesizes(originalURL string) (uint64, uint64, error) {
+func (backend *s3Backend) Filesizes(originalURL string) (uint64, uint64, error) {
+    s3Client := s3.New(backend.s3Session)
     url, err := URL.Parse(originalURL)
 	if err != nil {
 		return 0, 0, err
@@ -31,12 +38,7 @@ func (*s3storage) Filesizes(originalURL string) (uint64, uint64, error) {
     keyOriginal := path[2]
     keyLow := strings.Replace(keyOriginal, "_original", "_low", -1)
 
-    sess := session.Must(session.NewSessionWithOptions(session.Options{
-        SharedConfigState: session.SharedConfigEnable,
-    }))
-    svc := s3.New(sess)
-
-    originalResult, err := svc.HeadObject(&s3.HeadObjectInput{
+    originalResult, err := s3Client.HeadObject(&s3.HeadObjectInput{
         Bucket: &bucket,
         Key: &keyOriginal,
     })
@@ -48,7 +50,7 @@ func (*s3storage) Filesizes(originalURL string) (uint64, uint64, error) {
         return 0, 0, errors.New("content length < 0 for original asset")
     }
 
-    lowResult, err := svc.HeadObject(&s3.HeadObjectInput{
+    lowResult, err := s3Client.HeadObject(&s3.HeadObjectInput{
         Bucket: &bucket,
         Key: &keyLow,
     })
@@ -63,8 +65,9 @@ func (*s3storage) Filesizes(originalURL string) (uint64, uint64, error) {
     return uint64(originalLength), uint64(lowLength), nil
 }
 
-func (*s3storage) Delete(remotepaths []string) error {
-    s3objects := map[string]*[]*s3.ObjectIdentifier{}
+func (backend *s3Backend) Delete(remotepaths []string) error {
+    s3Client := s3.New(backend.s3Session)
+    s3Objects := map[string]*[]*s3.ObjectIdentifier{}
 
     for _, remotepath := range remotepaths {
         url, err := URL.Parse(remotepath)
@@ -75,21 +78,16 @@ func (*s3storage) Delete(remotepaths []string) error {
 	    bucket := path[1]
         key := path[2]
 
-        _, ok := s3objects[bucket]
+        _, ok := s3Objects[bucket]
 		if !ok {
-			s3objects[bucket] = &[]*s3.ObjectIdentifier{}
+			s3Objects[bucket] = &[]*s3.ObjectIdentifier{}
         }
-        *s3objects[bucket] = append(*s3objects[bucket], &s3.ObjectIdentifier {
+        *s3Objects[bucket] = append(*s3Objects[bucket], &s3.ObjectIdentifier {
             Key: &key,
         })
     }
 
-    sess := session.Must(session.NewSessionWithOptions(session.Options{
-        SharedConfigState: session.SharedConfigEnable,
-    }))
-    svc := s3.New(sess)
-
-    for bucket, objects := range s3objects {
+    for bucket, objects := range s3Objects {
         input := &s3.DeleteObjectsInput {
             Bucket: &bucket,
             Delete: &s3.Delete{
@@ -97,7 +95,7 @@ func (*s3storage) Delete(remotepaths []string) error {
                 Quiet: aws.Bool(true),
             },
         }
-        _, err := svc.DeleteObjects(input)
+        _, err := s3Client.DeleteObjects(input)
         if err != nil {
             return err
         }
