@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -28,7 +29,6 @@ import (
 
 var logger *log.Logger = log.New(os.Stdout, "[INFO] ServerLog: ", log.LstdFlags)
 var errLogger *log.Logger = log.New(os.Stderr, "[ERROR] ServerLog: ", log.LstdFlags | log.Lshortfile)
-var storageBackend = storage.NewS3Backend()
 var notificationService notification.NotificationService
 
 type invalidArgError struct {
@@ -46,6 +46,16 @@ func validateArgsNotZero(strings []string) error {
         }
     }
     return nil
+}
+
+// tokenFromHeader tries to retreive the token string from the "Authorization"
+// reqeust header in the format "Authorization: Bearer TOKEN"
+func tokenFromHeader(r *http.Request) (string, error) {
+	bearer := r.Header.Get("Authorization")
+	if len(bearer) > 7 && strings.ToUpper(bearer[0:6]) == "BEARER" {
+        return bearer[7:], nil
+	}
+	return "", errors.New("unable to extract token from request")
 }
 
 func main() {
@@ -709,7 +719,20 @@ func createAsset(response http.ResponseWriter, request *http.Request, neoDB *dat
         return
     }
 
-    httpStatus, err, totalsize := createSingleAsset(asset, token.UID, neoDB)
+    stringToken, err := tokenFromHeader(request)
+    if err != nil {
+        response.WriteHeader(http.StatusInternalServerError)
+        response.Write([]byte(err.Error()))
+        return
+    }
+    storageClient, err := storage.NewS3Client(stringToken)
+    if err != nil {
+        response.WriteHeader(http.StatusInternalServerError)
+        errLogger.Println(err.Error())
+        return
+    }
+
+    httpStatus, err, totalsize := createSingleAsset(asset, token.UID, storageClient, neoDB)
     if err != nil {
         response.WriteHeader(httpStatus)
         if httpStatus == http.StatusInternalServerError {
@@ -748,14 +771,26 @@ func patchAssets(response http.ResponseWriter, request *http.Request, neoDB *dat
         return
     }
 
+    stringToken, err := tokenFromHeader(request)
+    if err != nil {
+        response.WriteHeader(http.StatusInternalServerError)
+        response.Write([]byte(err.Error()))
+        return
+    }
+    storageClient, err := storage.NewS3Client(stringToken)
+    if err != nil {
+        response.WriteHeader(http.StatusInternalServerError)
+        errLogger.Println(err.Error())
+        return
+    }
+
     var httpStatus int
-    var err error
     var resultData = make(map[string]int)
 
     if len(payload.CREATE) != 0 {
         for _, asset := range payload.CREATE {
             var totalsize *uint64
-            httpStatus, err, totalsize = createSingleAsset(asset, token.UID, neoDB)
+            httpStatus, err, totalsize = createSingleAsset(asset, token.UID, storageClient, neoDB)
             if err != nil {
                 break
             }
@@ -776,7 +811,7 @@ func patchAssets(response http.ResponseWriter, request *http.Request, neoDB *dat
     }
 
     if len(payload.DELETE) != 0 {
-        httpStatus, err = deleteAssets(payload.DELETE, token.UID, neoDB)
+        httpStatus, err = deleteAssets(payload.DELETE, token.UID, storageClient, neoDB)
     }
 
     if err != nil {
@@ -803,7 +838,7 @@ func patchAssets(response http.ResponseWriter, request *http.Request, neoDB *dat
     }
 }
 
-func createSingleAsset(asset asset, uid string, neoDB *database.Neo4j) (int, error, *uint64) {
+func createSingleAsset(asset asset, uid string, storageClient storage.StorageClient, neoDB *database.Neo4j) (int, error, *uint64) {
     if err := validateArgsNotZero([]string{asset.AssetID, asset.RemotePath, asset.Key}); err != nil {
         return http.StatusBadRequest, err, nil
     }
@@ -814,7 +849,7 @@ func createSingleAsset(asset asset, uid string, neoDB *database.Neo4j) (int, err
 
     var totalsize *uint64
     if asset.RemotePathOrig != nil {
-        originalLength, lowLength, err := storageBackend.Filesizes(*asset.RemotePathOrig)
+        originalLength, lowLength, err := storageClient.Filesizes(*asset.RemotePathOrig)
         // 128 KB minimum
         if originalLength < 131072 {
             originalLength = 131072
@@ -841,7 +876,7 @@ func createSingleAsset(asset asset, uid string, neoDB *database.Neo4j) (int, err
     return http.StatusCreated, nil, totalsize
 }
 
-func deleteAssets(assetIDs []string, uid string, neoDB *database.Neo4j) (int, error) {
+func deleteAssets(assetIDs []string, uid string, storageClient storage.StorageClient, neoDB *database.Neo4j) (int, error) {
     if len(assetIDs) == 0 {
         return http.StatusBadRequest, errors.New("AssetIDs is empty")
     }
@@ -851,7 +886,7 @@ func deleteAssets(assetIDs []string, uid string, neoDB *database.Neo4j) (int, er
         return http.StatusInternalServerError, err
     }
 
-    err = storageBackend.Delete(*objectsToDelete)
+    err = storageClient.Delete(*objectsToDelete)
     if err != nil {
         return http.StatusInternalServerError, err
     }
@@ -880,10 +915,22 @@ func patchAssetsRemoteOriginalPaths(response http.ResponseWriter, request *http.
         return
     }
 
-    var err error
+    stringToken, err := tokenFromHeader(request)
+    if err != nil {
+        response.WriteHeader(http.StatusInternalServerError)
+        response.Write([]byte(err.Error()))
+        return
+    }
+    storageClient, err := storage.NewS3Client(stringToken)
+    if err != nil {
+        response.WriteHeader(http.StatusInternalServerError)
+        errLogger.Println(err.Error())
+        return
+    }
+
     var resultData = make(map[string]int)
     for assetID, remotePathOriginal := range payload {
-        originalLength, lowLength, err := storageBackend.Filesizes(remotePathOriginal)
+        originalLength, lowLength, err := storageClient.Filesizes(remotePathOriginal)
         // 128 KB minimum
         if originalLength < 131072 {
             originalLength = 131072
@@ -949,7 +996,20 @@ func putAssetRemotePathOriginal(response http.ResponseWriter, request *http.Requ
         return
     }
 
-    originalLength, lowLength, err := storageBackend.Filesizes(asset.Remotepathorig)
+    stringToken, err := tokenFromHeader(request)
+    if err != nil {
+        response.WriteHeader(http.StatusInternalServerError)
+        response.Write([]byte(err.Error()))
+        return
+    }
+    storageClient, err := storage.NewS3Client(stringToken)
+    if err != nil {
+        response.WriteHeader(http.StatusInternalServerError)
+        errLogger.Println(err.Error())
+        return
+    }
+
+    originalLength, lowLength, err := storageClient.Filesizes(asset.Remotepathorig)
     // 128 KB minimum
     if originalLength < 131072 {
         originalLength = 131072
