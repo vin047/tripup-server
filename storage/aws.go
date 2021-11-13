@@ -17,10 +17,12 @@ type s3Backend struct {
 
 func NewS3Backend() *s3Backend {
     endpoint := os.Getenv("AWS_ENDPOINT")
+    pathStyle := endpoint != ""
     return &s3Backend{
         s3Session: session.Must(session.NewSessionWithOptions(session.Options{
             Config: aws.Config{
-                Endpoint: &endpoint,
+                Endpoint: aws.String(endpoint),
+                S3ForcePathStyle: aws.Bool(pathStyle),
             },
             SharedConfigState: session.SharedConfigEnable,
         }))}
