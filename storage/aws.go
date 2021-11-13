@@ -7,27 +7,53 @@ import (
 	"strings"
 
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/aws/aws-sdk-go/service/sts"
 )
 
-type s3Backend struct {
+type s3Client struct {
     s3Session *session.Session
 }
 
-func NewS3Backend() *s3Backend {
+func NewS3Client(idToken string) (*s3Client, error) {
     endpoint := os.Getenv("AWS_ENDPOINT")
-    return &s3Backend{
+    s3PathStyle := endpoint != ""
+    stsSession := session.Must(session.NewSessionWithOptions(session.Options{
+        Config: aws.Config{
+            Endpoint: aws.String(endpoint),
+        },
+        SharedConfigState: session.SharedConfigEnable,
+    }))
+
+    stsService := sts.New(stsSession)
+    input := &sts.AssumeRoleWithWebIdentityInput{
+		RoleArn:          aws.String("arn:aws:iam::123456789012:role/FederatedWebIdentityRole"),
+		RoleSessionName:  aws.String("app1"),
+		WebIdentityToken: aws.String(idToken),
+	}
+    result, err := stsService.AssumeRoleWithWebIdentity(input)
+    if err != nil {
+        return nil, err
+    }
+
+    stsCredentials := credentials.NewStaticCredentials(*result.Credentials.AccessKeyId, *result.Credentials.SecretAccessKey, *result.Credentials.SessionToken)
+    s3Client := s3Client{
         s3Session: session.Must(session.NewSessionWithOptions(session.Options{
             Config: aws.Config{
-                Endpoint: &endpoint,
+                Credentials: stsCredentials,
+                Endpoint: aws.String(endpoint),
+                S3ForcePathStyle: aws.Bool(s3PathStyle),
             },
             SharedConfigState: session.SharedConfigEnable,
-        }))}
+        })),
+    }
+    return &s3Client, nil
 }
 
-func (backend *s3Backend) Filesizes(originalURL string) (uint64, uint64, error) {
-    s3Client := s3.New(backend.s3Session)
+func (client *s3Client) Filesizes(originalURL string) (uint64, uint64, error) {
+    s3Service := s3.New(client.s3Session)
     url, err := URL.Parse(originalURL)
 	if err != nil {
 		return 0, 0, err
@@ -38,7 +64,7 @@ func (backend *s3Backend) Filesizes(originalURL string) (uint64, uint64, error) 
     keyOriginal := path[2]
     keyLow := strings.Replace(keyOriginal, "_original", "_low", -1)
 
-    originalResult, err := s3Client.HeadObject(&s3.HeadObjectInput{
+    originalResult, err := s3Service.HeadObject(&s3.HeadObjectInput{
         Bucket: &bucket,
         Key: &keyOriginal,
     })
@@ -50,7 +76,7 @@ func (backend *s3Backend) Filesizes(originalURL string) (uint64, uint64, error) 
         return 0, 0, errors.New("content length < 0 for original asset")
     }
 
-    lowResult, err := s3Client.HeadObject(&s3.HeadObjectInput{
+    lowResult, err := s3Service.HeadObject(&s3.HeadObjectInput{
         Bucket: &bucket,
         Key: &keyLow,
     })
@@ -65,8 +91,8 @@ func (backend *s3Backend) Filesizes(originalURL string) (uint64, uint64, error) 
     return uint64(originalLength), uint64(lowLength), nil
 }
 
-func (backend *s3Backend) Delete(remotepaths []string) error {
-    s3Client := s3.New(backend.s3Session)
+func (client *s3Client) Delete(remotepaths []string) error {
+    s3Service := s3.New(client.s3Session)
     s3Objects := map[string]*[]*s3.ObjectIdentifier{}
 
     for _, remotepath := range remotepaths {
@@ -95,7 +121,7 @@ func (backend *s3Backend) Delete(remotepaths []string) error {
                 Quiet: aws.Bool(true),
             },
         }
-        _, err := s3Client.DeleteObjects(input)
+        _, err := s3Service.DeleteObjects(input)
         if err != nil {
             return err
         }
