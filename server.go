@@ -29,6 +29,7 @@ import (
 
 var logger *log.Logger = log.New(os.Stdout, "[INFO] ServerLog: ", log.LstdFlags)
 var errLogger *log.Logger = log.New(os.Stderr, "[ERROR] ServerLog: ", log.LstdFlags | log.Lshortfile)
+var serverStorageClient storage.StorageClient
 var notificationService notification.NotificationService
 
 type invalidArgError struct {
@@ -58,9 +59,28 @@ func tokenFromHeader(r *http.Request) (string, error) {
 	return "", errors.New("unable to extract token from request")
 }
 
+func getStorageClient(request *http.Request) (storage.StorageClient, error) {
+    if serverStorageClient != nil {
+        return serverStorageClient, nil
+    }
+    stringToken, err := tokenFromHeader(request)
+    if err != nil {
+        return nil, err
+    }
+    return storage.NewS3Client(stringToken)
+}
+
 func main() {
     quit := make(chan os.Signal)                        // set up a channel called 'quit' which takes os signals
     signal.Notify(quit, os.Interrupt, syscall.SIGTERM)  // capture SIGINT from CLI and SIGTERM from OS, redirect to 'quit' channel
+
+    // initialize storage client
+    storageClient, err := storage.NewS3ClientFromEnv()
+    if err == nil {
+        serverStorageClient = storageClient
+    } else {
+        logger.Print(err.Error(), "- will use STS for obtaining credentials to the storage server")
+    }
 
     // initialise notification service
     oneSignalAppID, exists := os.LookupEnv("ONESIGNAL_APPID")
@@ -719,13 +739,7 @@ func createAsset(response http.ResponseWriter, request *http.Request, neoDB *dat
         return
     }
 
-    stringToken, err := tokenFromHeader(request)
-    if err != nil {
-        response.WriteHeader(http.StatusInternalServerError)
-        response.Write([]byte(err.Error()))
-        return
-    }
-    storageClient, err := storage.NewS3Client(stringToken)
+    storageClient, err := getStorageClient(request)
     if err != nil {
         response.WriteHeader(http.StatusInternalServerError)
         errLogger.Println(err.Error())
@@ -771,13 +785,7 @@ func patchAssets(response http.ResponseWriter, request *http.Request, neoDB *dat
         return
     }
 
-    stringToken, err := tokenFromHeader(request)
-    if err != nil {
-        response.WriteHeader(http.StatusInternalServerError)
-        response.Write([]byte(err.Error()))
-        return
-    }
-    storageClient, err := storage.NewS3Client(stringToken)
+    storageClient, err := getStorageClient(request)
     if err != nil {
         response.WriteHeader(http.StatusInternalServerError)
         errLogger.Println(err.Error())
@@ -915,13 +923,7 @@ func patchAssetsRemoteOriginalPaths(response http.ResponseWriter, request *http.
         return
     }
 
-    stringToken, err := tokenFromHeader(request)
-    if err != nil {
-        response.WriteHeader(http.StatusInternalServerError)
-        response.Write([]byte(err.Error()))
-        return
-    }
-    storageClient, err := storage.NewS3Client(stringToken)
+    storageClient, err := getStorageClient(request)
     if err != nil {
         response.WriteHeader(http.StatusInternalServerError)
         errLogger.Println(err.Error())
@@ -996,13 +998,7 @@ func putAssetRemotePathOriginal(response http.ResponseWriter, request *http.Requ
         return
     }
 
-    stringToken, err := tokenFromHeader(request)
-    if err != nil {
-        response.WriteHeader(http.StatusInternalServerError)
-        response.Write([]byte(err.Error()))
-        return
-    }
-    storageClient, err := storage.NewS3Client(stringToken)
+    storageClient, err := getStorageClient(request)
     if err != nil {
         response.WriteHeader(http.StatusInternalServerError)
         errLogger.Println(err.Error())

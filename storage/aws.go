@@ -17,6 +17,31 @@ type s3Client struct {
     s3Session *session.Session
 }
 
+func NewS3ClientFromEnv() (*s3Client, error) {
+    _, accessKeyFound := os.LookupEnv("AWS_ACCESS_KEY_ID")
+    if !accessKeyFound {
+        return nil, errors.New("AWS_ACCESS_KEY_ID missing")
+    }
+
+    _, secretKeyFound := os.LookupEnv("AWS_SECRET_ACCESS_KEY")
+    if !secretKeyFound {
+        return nil, errors.New("AWS_SECRET_ACCESS_KEY missing")
+    }
+
+    endpoint := os.Getenv("AWS_ENDPOINT")
+    s3PathStyle := endpoint != ""
+    s3Client := s3Client{
+        s3Session: session.Must(session.NewSessionWithOptions(session.Options{
+            Config: aws.Config{
+                Endpoint: aws.String(endpoint),
+                S3ForcePathStyle: aws.Bool(s3PathStyle),
+            },
+            SharedConfigState: session.SharedConfigEnable,
+        })),
+    }
+    return &s3Client, nil
+}
+
 func NewS3Client(idToken string) (*s3Client, error) {
     endpoint := os.Getenv("AWS_ENDPOINT")
     s3PathStyle := endpoint != ""
