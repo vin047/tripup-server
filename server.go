@@ -12,14 +12,12 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
-	"strings"
 	"syscall"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/pressly/chi"
 	"github.com/pressly/chi/middleware"
-	firebaseauth "github.com/vin047/firebase-middleware"
 
 	"github.com/tripupapp/tripup-server/auth"
 	"github.com/tripupapp/tripup-server/database"
@@ -27,10 +25,13 @@ import (
 	"github.com/tripupapp/tripup-server/storage"
 )
 
-var logger *log.Logger = log.New(os.Stdout, "[INFO] ServerLog: ", log.LstdFlags)
-var errLogger *log.Logger = log.New(os.Stderr, "[ERROR] ServerLog: ", log.LstdFlags | log.Lshortfile)
-var serverStorageClient storage.StorageClient
-var notificationService notification.NotificationService
+var (
+    logger              *log.Logger = log.New(os.Stdout, "[INFO] ServerLog: ", log.LstdFlags)
+    errLogger           *log.Logger = log.New(os.Stderr, "[ERROR] ServerLog: ", log.LstdFlags | log.Lshortfile)
+    authClient          *auth.OIDCClient
+    serverStorageClient storage.StorageClient
+    notificationService notification.NotificationService
+)
 
 type invalidArgError struct {
     argNumber int
@@ -49,21 +50,11 @@ func validateArgsNotZero(strings []string) error {
     return nil
 }
 
-// tokenFromHeader tries to retreive the token string from the "Authorization"
-// reqeust header in the format "Authorization: Bearer TOKEN"
-func tokenFromHeader(r *http.Request) (string, error) {
-	bearer := r.Header.Get("Authorization")
-	if len(bearer) > 7 && strings.ToUpper(bearer[0:6]) == "BEARER" {
-        return bearer[7:], nil
-	}
-	return "", errors.New("unable to extract token from request")
-}
-
 func getStorageClient(request *http.Request) (storage.StorageClient, error) {
     if serverStorageClient != nil {
         return serverStorageClient, nil
     }
-    stringToken, err := tokenFromHeader(request)
+    stringToken, err := auth.RawOIDCTokenFromHeader(request)
     if err != nil {
         return nil, err
     }
@@ -73,6 +64,21 @@ func getStorageClient(request *http.Request) (storage.StorageClient, error) {
 func main() {
     quit := make(chan os.Signal)                        // set up a channel called 'quit' which takes os signals
     signal.Notify(quit, os.Interrupt, syscall.SIGTERM)  // capture SIGINT from CLI and SIGTERM from OS, redirect to 'quit' channel
+
+    // initialize auth client
+    oidcIssuer, exists := os.LookupEnv("OIDC_ISSUER")
+    if !exists {
+        errLogger.Panicln("OIDC_ISSUER not set")
+    }
+    oidcClientID, exists := os.LookupEnv("OIDC_CLIENT_ID")
+    if !exists {
+        errLogger.Panicln("OIDC_CLIENT_ID not set")
+    }
+    oidcClient, err := auth.NewOIDCClient(oidcIssuer, oidcClientID)
+    if err != nil {
+        errLogger.Panicln("unable to create OIDC Client:", err.Error())
+    }
+    authClient = oidcClient
 
     // initialize storage client
     storageClient, err := storage.NewS3ClientFromEnv()
@@ -111,7 +117,7 @@ func main() {
         errLogger.Panicln(err)
     }
 
-    router.Use(firebaseauth.JWTHandler(nil))    // firebase authorization middleware
+    router.Use(authClient.OIDCHandler())    // OIDC authorization middleware
     router.Use(middleware.Timeout(timeout)) // stop processing request after X seconds
 
     // setup routing
@@ -303,14 +309,13 @@ func ping(response http.ResponseWriter, request *http.Request, neoDB *database.N
 func getUUID(response http.ResponseWriter, request *http.Request, neoDB *database.Neo4j) {
     defer GenericErrorHandler(response)
 
-    token, ok := firebaseauth.AuthToken(request.Context())
+    token, ok := authClient.IDToken(request)
     if !ok {
-        response.WriteHeader(http.StatusUnauthorized)
-        response.Write([]byte("Unable to extract token from request context"))
+        response.WriteHeader(http.StatusInternalServerError)
         return
     }
 
-    data, err := neoDB.GetUser(token.UID)
+    data, err := neoDB.GetUser(token.Subject)
 
     switch err {
     case nil:
@@ -333,10 +338,9 @@ func getUUID(response http.ResponseWriter, request *http.Request, neoDB *databas
 func createUser(response http.ResponseWriter, request *http.Request, neoDB *database.Neo4j) {
     defer GenericErrorHandler(response)
 
-    token, ok := firebaseauth.AuthToken(request.Context())
+    token, ok := authClient.IDToken(request)
     if !ok {
-        response.WriteHeader(http.StatusUnauthorized)
-        response.Write([]byte("Unable to extract token from request context"))
+        response.WriteHeader(http.StatusInternalServerError)
         return
     }
 
@@ -357,7 +361,7 @@ func createUser(response http.ResponseWriter, request *http.Request, neoDB *data
         return
     }
 
-    authProviders, err := auth.GetUserAuthProviders(request.Context(), token.UID)
+    authProviders, err := auth.GetUserAuthProviders(request.Context(), token.Subject)
     if err != nil {
         response.WriteHeader(http.StatusInternalServerError)
         errLogger.Printf("Invalid auth providers – %+v\n", authProviders)
@@ -367,7 +371,7 @@ func createUser(response http.ResponseWriter, request *http.Request, neoDB *data
     userid := uuid.New()
     // TODO: check user id not in use
 
-    err = neoDB.CreateUser(token.UID, userid.String(), authProviders, user.Publickey, user.Privatekey, "1")
+    err = neoDB.CreateUser(token.Subject, userid.String(), authProviders, user.Publickey, user.Privatekey, "1")
     if err != nil {
         response.WriteHeader(http.StatusInternalServerError)
         errLogger.Println(err.Error())
@@ -380,21 +384,20 @@ func createUser(response http.ResponseWriter, request *http.Request, neoDB *data
 func updateUserContact(response http.ResponseWriter, request *http.Request, neoDB *database.Neo4j) {
     defer GenericErrorHandler(response)
 
-    token, ok := firebaseauth.AuthToken(request.Context())
+    token, ok := authClient.IDToken(request)
     if !ok {
-        response.WriteHeader(http.StatusUnauthorized)
-        response.Write([]byte("Unable to extract token from request context"))
+        response.WriteHeader(http.StatusInternalServerError)
         return
     }
 
-    authProviders, err := auth.GetUserAuthProviders(request.Context(), token.UID)
+    authProviders, err := auth.GetUserAuthProviders(request.Context(), token.Subject)
     if err != nil {
         response.WriteHeader(http.StatusInternalServerError)
         errLogger.Printf("Invalid auth providers – %+v\n", authProviders)
         return
     }
 
-    err = neoDB.UpdateUserContact(token.UID, authProviders)
+    err = neoDB.UpdateUserContact(token.Subject, authProviders)
     if err != nil {
         response.WriteHeader(http.StatusInternalServerError)
         errLogger.Println(err.Error())
@@ -405,13 +408,6 @@ func updateUserContact(response http.ResponseWriter, request *http.Request, neoD
 
 func getUser(response http.ResponseWriter, request *http.Request, neoDB *database.Neo4j) {
     defer GenericErrorHandler(response)
-
-    _, ok := firebaseauth.AuthToken(request.Context())
-    if !ok {
-        response.WriteHeader(http.StatusUnauthorized)
-        response.Write([]byte("Unable to extract token from request context"))
-        return
-    }
 
     userID := chi.URLParam(request, "userID")
     if _, err := uuid.Parse(userID); err != nil {
@@ -437,14 +433,13 @@ func getUser(response http.ResponseWriter, request *http.Request, neoDB *databas
 func getGroups(response http.ResponseWriter, request *http.Request, neoDB *database.Neo4j) {
     defer GenericErrorHandler(response)
 
-    token, ok := firebaseauth.AuthToken(request.Context())
+    token, ok := authClient.IDToken(request)
     if !ok {
-        response.WriteHeader(http.StatusUnauthorized)
-        response.Write([]byte("Unable to extract token from request context"))
+        response.WriteHeader(http.StatusInternalServerError)
         return
     }
 
-    data, err := neoDB.GetGroups(token.UID)
+    data, err := neoDB.GetGroups(token.Subject)
     switch err {
     case nil:
         dataJSON, err := json.Marshal(data)
@@ -466,10 +461,9 @@ func getGroups(response http.ResponseWriter, request *http.Request, neoDB *datab
 func joinGroup(response http.ResponseWriter, request *http.Request, neoDB *database.Neo4j) {
     defer GenericErrorHandler(response)
 
-    token, ok := firebaseauth.AuthToken(request.Context())
+    token, ok := authClient.IDToken(request)
     if !ok {
-        response.WriteHeader(http.StatusUnauthorized)
-        response.Write([]byte("Unable to extract token from request context"))
+        response.WriteHeader(http.StatusInternalServerError)
         return
     }
 
@@ -489,7 +483,7 @@ func joinGroup(response http.ResponseWriter, request *http.Request, neoDB *datab
         return
     }
 
-    err := neoDB.JoinGroup(token.UID, groupID, group.Key)
+    err := neoDB.JoinGroup(token.Subject, groupID, group.Key)
     if err != nil {
         response.WriteHeader(http.StatusInternalServerError)
         errLogger.Println(err.Error())
@@ -498,7 +492,7 @@ func joinGroup(response http.ResponseWriter, request *http.Request, neoDB *datab
 
         // notify users
         var userIDs []string
-        groupUsers, err := neoDB.GetUsersInGroup(token.UID, groupID)
+        groupUsers, err := neoDB.GetUsersInGroup(token.Subject, groupID)
         if err == io.EOF {
             return
         }
@@ -516,10 +510,9 @@ func joinGroup(response http.ResponseWriter, request *http.Request, neoDB *datab
 func createGroup(response http.ResponseWriter, request *http.Request, neoDB *database.Neo4j) {
     defer GenericErrorHandler(response)
 
-    token, ok := firebaseauth.AuthToken(request.Context())
+    token, ok := authClient.IDToken(request)
     if !ok {
-        response.WriteHeader(http.StatusUnauthorized)
-        response.Write([]byte("Unable to extract token from request context"))
+        response.WriteHeader(http.StatusInternalServerError)
         return
     }
 
@@ -542,7 +535,7 @@ func createGroup(response http.ResponseWriter, request *http.Request, neoDB *dat
     groupid := uuid.New()
     // TODO: verify trip uuid isn't already in use
 
-    err := neoDB.CreateGroup(token.UID, groupid.String(), group.Name, group.Key)
+    err := neoDB.CreateGroup(token.Subject, groupid.String(), group.Name, group.Key)
     if err != nil {
         response.WriteHeader(http.StatusInternalServerError)
         errLogger.Println(err.Error())
@@ -555,10 +548,9 @@ func createGroup(response http.ResponseWriter, request *http.Request, neoDB *dat
 func addUsersToGroup(response http.ResponseWriter, request *http.Request, neoDB *database.Neo4j) {
     defer GenericErrorHandler(response)
 
-    token, ok := firebaseauth.AuthToken(request.Context())
+    token, ok := authClient.IDToken(request)
     if !ok {
-        response.WriteHeader(http.StatusUnauthorized)
-        response.Write([]byte("Unable to extract token from request context"))
+        response.WriteHeader(http.StatusInternalServerError)
         return
     }
 
@@ -584,7 +576,7 @@ func addUsersToGroup(response http.ResponseWriter, request *http.Request, neoDB 
         return
     }
 
-    err := neoDB.AddUsersToGroup(token.UID, groupID, payload.Users)
+    err := neoDB.AddUsersToGroup(token.Subject, groupID, payload.Users)
     if err != nil {
         response.WriteHeader(http.StatusInternalServerError)
         errLogger.Println(err.Error())
@@ -676,10 +668,9 @@ func getUsersFromAddressable(response http.ResponseWriter, request *http.Request
 func getGroupUsers(response http.ResponseWriter, request *http.Request, neoDB *database.Neo4j) {
     defer GenericErrorHandler(response)
 
-    token, ok := firebaseauth.AuthToken(request.Context())
+    token, ok := authClient.IDToken(request)
     if !ok {
-        response.WriteHeader(http.StatusUnauthorized)
-        response.Write([]byte("Unable to extract token from request context"))
+        response.WriteHeader(http.StatusInternalServerError)
         return
     }
 
@@ -690,7 +681,7 @@ func getGroupUsers(response http.ResponseWriter, request *http.Request, neoDB *d
         return
     }
 
-    data, err := neoDB.GetUsersInGroup(token.UID, groupID)
+    data, err := neoDB.GetUsersInGroup(token.Subject, groupID)
     if err == io.EOF {
         response.WriteHeader(http.StatusNoContent)
         return
@@ -725,10 +716,9 @@ type asset struct {
 func createAsset(response http.ResponseWriter, request *http.Request, neoDB *database.Neo4j) {
     defer GenericErrorHandler(response)
 
-    token, ok := firebaseauth.AuthToken(request.Context())
+    token, ok := authClient.IDToken(request)
     if !ok {
-        response.WriteHeader(http.StatusUnauthorized)
-        response.Write([]byte("Unable to extract token from request context"))
+        response.WriteHeader(http.StatusInternalServerError)
         return
     }
 
@@ -746,7 +736,7 @@ func createAsset(response http.ResponseWriter, request *http.Request, neoDB *dat
         return
     }
 
-    httpStatus, err, totalsize := createSingleAsset(asset, token.UID, storageClient, neoDB)
+    httpStatus, err, totalsize := createSingleAsset(asset, token.Subject, storageClient, neoDB)
     if err != nil {
         response.WriteHeader(httpStatus)
         if httpStatus == http.StatusInternalServerError {
@@ -768,10 +758,9 @@ func createAsset(response http.ResponseWriter, request *http.Request, neoDB *dat
 func patchAssets(response http.ResponseWriter, request *http.Request, neoDB *database.Neo4j) {
     defer GenericErrorHandler(response)
 
-    token, ok := firebaseauth.AuthToken(request.Context())
+    token, ok := authClient.IDToken(request)
     if !ok {
-        response.WriteHeader(http.StatusUnauthorized)
-        response.Write([]byte("Unable to extract token from request context"))
+        response.WriteHeader(http.StatusInternalServerError)
         return
     }
 
@@ -798,7 +787,7 @@ func patchAssets(response http.ResponseWriter, request *http.Request, neoDB *dat
     if len(payload.CREATE) != 0 {
         for _, asset := range payload.CREATE {
             var totalsize *uint64
-            httpStatus, err, totalsize = createSingleAsset(asset, token.UID, storageClient, neoDB)
+            httpStatus, err, totalsize = createSingleAsset(asset, token.Subject, storageClient, neoDB)
             if err != nil {
                 break
             }
@@ -819,7 +808,7 @@ func patchAssets(response http.ResponseWriter, request *http.Request, neoDB *dat
     }
 
     if len(payload.DELETE) != 0 {
-        httpStatus, err = deleteAssets(payload.DELETE, token.UID, storageClient, neoDB)
+        httpStatus, err = deleteAssets(payload.DELETE, token.Subject, storageClient, neoDB)
     }
 
     if err != nil {
@@ -905,10 +894,9 @@ func deleteAssets(assetIDs []string, uid string, storageClient storage.StorageCl
 func patchAssetsRemoteOriginalPaths(response http.ResponseWriter, request *http.Request, neoDB *database.Neo4j) {
     defer GenericErrorHandler(response)
 
-    token, ok := firebaseauth.AuthToken(request.Context())
+    token, ok := authClient.IDToken(request)
     if !ok {
-        response.WriteHeader(http.StatusUnauthorized)
-        response.Write([]byte("Unable to extract token from request context"))
+        response.WriteHeader(http.StatusInternalServerError)
         return
     }
 
@@ -944,7 +932,7 @@ func patchAssetsRemoteOriginalPaths(response http.ResponseWriter, request *http.
             break
         }
 
-        err = neoDB.AddPathForOriginalAsset(token.UID, assetID, remotePathOriginal, originalLength + lowLength)
+        err = neoDB.AddPathForOriginalAsset(token.Subject, assetID, remotePathOriginal, originalLength + lowLength)
         if err != nil {
             break
         }
@@ -971,9 +959,10 @@ func patchAssetsRemoteOriginalPaths(response http.ResponseWriter, request *http.
 func putAssetRemotePathOriginal(response http.ResponseWriter, request *http.Request, neoDB *database.Neo4j) {
     defer GenericErrorHandler(response)
 
-    token, ok := firebaseauth.AuthToken(request.Context())
+    token, ok := authClient.IDToken(request)
     if !ok {
-        errLogger.Panicln("can't extract auth token")
+        response.WriteHeader(http.StatusInternalServerError)
+        return
     }
 
     assetID := chi.URLParam(request, "assetID")
@@ -1018,7 +1007,7 @@ func putAssetRemotePathOriginal(response http.ResponseWriter, request *http.Requ
         errLogger.Println(err.Error())
     }
 
-    err = neoDB.AddPathForOriginalAsset(token.UID, assetID, asset.Remotepathorig, originalLength + lowLength)
+    err = neoDB.AddPathForOriginalAsset(token.Subject, assetID, asset.Remotepathorig, originalLength + lowLength)
     if err != nil {
         response.WriteHeader(http.StatusInternalServerError)
         errLogger.Println(err.Error())
@@ -1031,10 +1020,9 @@ func putAssetRemotePathOriginal(response http.ResponseWriter, request *http.Requ
 func putAssetOriginalFilename(response http.ResponseWriter, request *http.Request, neoDB *database.Neo4j) {
     defer GenericErrorHandler(response)
 
-    token, ok := firebaseauth.AuthToken(request.Context())
+    token, ok := authClient.IDToken(request)
     if !ok {
-        response.WriteHeader(http.StatusUnauthorized)
-        response.Write([]byte("Unable to extract token from request context"))
+        response.WriteHeader(http.StatusInternalServerError)
         return
     }
 
@@ -1057,7 +1045,7 @@ func putAssetOriginalFilename(response http.ResponseWriter, request *http.Reques
     var data = map[string]string {
         assetID: payload.Originalfilename,
     }
-    if err := neoDB.SetAssetsOriginalFilenames(token.UID, data); err != nil {
+    if err := neoDB.SetAssetsOriginalFilenames(token.Subject, data); err != nil {
         response.WriteHeader(http.StatusInternalServerError)
         errLogger.Println(err.Error())
     } else {
@@ -1068,10 +1056,9 @@ func putAssetOriginalFilename(response http.ResponseWriter, request *http.Reques
 func patchAssetsOriginalFilenames(response http.ResponseWriter, request *http.Request, neoDB *database.Neo4j) {
     defer GenericErrorHandler(response)
 
-    token, ok := firebaseauth.AuthToken(request.Context())
+    token, ok := authClient.IDToken(request)
     if !ok {
-        response.WriteHeader(http.StatusUnauthorized)
-        response.Write([]byte("Unable to extract token from request context"))
+        response.WriteHeader(http.StatusInternalServerError)
         return
     }
 
@@ -1088,7 +1075,7 @@ func patchAssetsOriginalFilenames(response http.ResponseWriter, request *http.Re
         return
     }
 
-    if err := neoDB.SetAssetsOriginalFilenames(token.UID, payload); err != nil {
+    if err := neoDB.SetAssetsOriginalFilenames(token.Subject, payload); err != nil {
         response.WriteHeader(http.StatusInternalServerError)
         errLogger.Println(err.Error())
     } else {
@@ -1099,10 +1086,9 @@ func patchAssetsOriginalFilenames(response http.ResponseWriter, request *http.Re
 func amendGroupSharedAssets(response http.ResponseWriter, request *http.Request, neoDB *database.Neo4j) {
     defer GenericErrorHandler(response)
 
-    token, ok := firebaseauth.AuthToken(request.Context())
+    token, ok := authClient.IDToken(request)
     if !ok {
-        response.WriteHeader(http.StatusUnauthorized)
-        response.Write([]byte("Unable to extract token from request context"))
+        response.WriteHeader(http.StatusInternalServerError)
         return
     }
 
@@ -1138,9 +1124,9 @@ func amendGroupSharedAssets(response http.ResponseWriter, request *http.Request,
 
     var err error
     if requestData.Share {
-        err = neoDB.ShareAssets(token.UID, groupID, requestData.AssetIDs, requestData.AssetKeys)
+        err = neoDB.ShareAssets(token.Subject, groupID, requestData.AssetIDs, requestData.AssetKeys)
     } else {
-        err = neoDB.UnshareAssets(token.UID, groupID, requestData.AssetIDs)
+        err = neoDB.UnshareAssets(token.Subject, groupID, requestData.AssetIDs)
     }
 
     if err != nil {
@@ -1151,7 +1137,7 @@ func amendGroupSharedAssets(response http.ResponseWriter, request *http.Request,
 
         // notify users
         var userIDs []string
-        groupUsers, err := neoDB.GetUsersInGroup(token.UID, groupID)
+        groupUsers, err := neoDB.GetUsersInGroup(token.Subject, groupID)
         if err == io.EOF {
             return
         }
@@ -1173,9 +1159,10 @@ func amendGroupSharedAssets(response http.ResponseWriter, request *http.Request,
 func SetFavourite(response http.ResponseWriter, request *http.Request, neoDB *database.Neo4j) {
     defer GenericErrorHandler(response)
 
-    token, ok := firebaseauth.AuthToken(request.Context())
+    token, ok := authClient.IDToken(request)
     if !ok {
-        errLogger.Panicln("can't extract auth token")
+        response.WriteHeader(http.StatusInternalServerError)
+        return
     }
 
     type Props struct {
@@ -1191,9 +1178,9 @@ func SetFavourite(response http.ResponseWriter, request *http.Request, neoDB *da
     }
 
     if props.Favourite {
-        neoDB.SetFavourite(token.UID, props.TripID, props.ImageID)
+        neoDB.SetFavourite(token.Subject, props.TripID, props.ImageID)
     } else {
-        neoDB.UnsetFavourite(token.UID, props.TripID, props.ImageID)
+        neoDB.UnsetFavourite(token.Subject, props.TripID, props.ImageID)
     }
 
     response.WriteHeader(http.StatusOK)
@@ -1202,10 +1189,9 @@ func SetFavourite(response http.ResponseWriter, request *http.Request, neoDB *da
 func patchSchema0(response http.ResponseWriter, request *http.Request, neoDB *database.Neo4j) {
     defer GenericErrorHandler(response)
 
-    token, ok := firebaseauth.AuthToken(request.Context())
+    token, ok := authClient.IDToken(request)
     if !ok {
-        response.WriteHeader(http.StatusUnauthorized)
-        response.Write([]byte("Unable to extract token from request context"))
+        response.WriteHeader(http.StatusInternalServerError)
         return
     }
 
@@ -1219,7 +1205,7 @@ func patchSchema0(response http.ResponseWriter, request *http.Request, neoDB *da
         return
     }
 
-    if err := neoDB.PatchSchema0(token.UID, patchData.AssetKeys, patchData.AssetMD5s); err != nil {
+    if err := neoDB.PatchSchema0(token.Subject, patchData.AssetKeys, patchData.AssetMD5s); err != nil {
         response.WriteHeader(http.StatusInternalServerError)
         errLogger.Println(err.Error())
         return
@@ -1230,14 +1216,13 @@ func patchSchema0(response http.ResponseWriter, request *http.Request, neoDB *da
 func getAssets(response http.ResponseWriter, request *http.Request, neoDB *database.Neo4j) {
     defer GenericErrorHandler(response)
 
-    token, ok := firebaseauth.AuthToken(request.Context())
+    token, ok := authClient.IDToken(request)
     if !ok {
-        response.WriteHeader(http.StatusUnauthorized)
-        response.Write([]byte("Unable to extract token from request context"))
+        response.WriteHeader(http.StatusInternalServerError)
         return
     }
 
-    data, err := neoDB.GetAssets(token.UID)
+    data, err := neoDB.GetAssets(token.Subject)
     switch err {
     case nil:
         dataJSON, err := json.Marshal(data)
@@ -1259,14 +1244,13 @@ func getAssets(response http.ResponseWriter, request *http.Request, neoDB *datab
 func getAssetsSchema0(response http.ResponseWriter, request *http.Request, neoDB *database.Neo4j) {
     defer GenericErrorHandler(response)
 
-    token, ok := firebaseauth.AuthToken(request.Context())
+    token, ok := authClient.IDToken(request)
     if !ok {
-        response.WriteHeader(http.StatusUnauthorized)
-        response.Write([]byte("Unable to extract token from request context"))
+        response.WriteHeader(http.StatusInternalServerError)
         return
     }
 
-    data, err := neoDB.GetAssetsSchema0(token.UID)
+    data, err := neoDB.GetAssetsSchema0(token.Subject)
     switch err {
     case nil:
         dataJSON, err := json.Marshal(data)
@@ -1288,14 +1272,13 @@ func getAssetsSchema0(response http.ResponseWriter, request *http.Request, neoDB
 func getAssetsForAllGroups(response http.ResponseWriter, request *http.Request, neoDB *database.Neo4j) {
     defer GenericErrorHandler(response)
 
-    token, ok := firebaseauth.AuthToken(request.Context())
+    token, ok := authClient.IDToken(request)
     if !ok {
-        response.WriteHeader(http.StatusUnauthorized)
-        response.Write([]byte("Unable to extract token from request context"))
+        response.WriteHeader(http.StatusInternalServerError)
         return
     }
 
-    data, err := neoDB.GetAssetsForAllGroups(token.UID)
+    data, err := neoDB.GetAssetsForAllGroups(token.Subject)
 
     switch err {
     case nil:
@@ -1318,10 +1301,9 @@ func getAssetsForAllGroups(response http.ResponseWriter, request *http.Request, 
 func leaveGroup(response http.ResponseWriter, request *http.Request, neoDB *database.Neo4j) {
     defer GenericErrorHandler(response)
 
-    token, ok := firebaseauth.AuthToken(request.Context())
+    token, ok := authClient.IDToken(request)
     if !ok {
-        response.WriteHeader(http.StatusUnauthorized)
-        response.Write([]byte("Unable to extract token from request context"))
+        response.WriteHeader(http.StatusInternalServerError)
         return
     }
 
@@ -1332,7 +1314,7 @@ func leaveGroup(response http.ResponseWriter, request *http.Request, neoDB *data
         return
     }
 
-    err := neoDB.LeaveGroup(token.UID, groupID)
+    err := neoDB.LeaveGroup(token.Subject, groupID)
     if err != nil {
         response.WriteHeader(http.StatusInternalServerError)
         errLogger.Println(err.Error())
@@ -1341,7 +1323,7 @@ func leaveGroup(response http.ResponseWriter, request *http.Request, neoDB *data
 
         // notify users
         var userIDs []string
-        groupUsers, err := neoDB.GetUsersInGroup(token.UID, groupID)
+        groupUsers, err := neoDB.GetUsersInGroup(token.Subject, groupID)
         if err == io.EOF {
             return
         }
@@ -1359,10 +1341,9 @@ func leaveGroup(response http.ResponseWriter, request *http.Request, neoDB *data
 func amendGroupAssets(response http.ResponseWriter, request *http.Request, neoDB *database.Neo4j) {
     defer GenericErrorHandler(response)
 
-    token, ok := firebaseauth.AuthToken(request.Context())
+    token, ok := authClient.IDToken(request)
     if !ok {
-        response.WriteHeader(http.StatusUnauthorized)
-        response.Write([]byte("Unable to extract token from request context"))
+        response.WriteHeader(http.StatusInternalServerError)
         return
     }
 
@@ -1391,9 +1372,9 @@ func amendGroupAssets(response http.ResponseWriter, request *http.Request, neoDB
 
     var err error
     if requestData.Add {
-        err = neoDB.AddAssetsToGroup(token.UID, groupID, requestData.AssetIDs)
+        err = neoDB.AddAssetsToGroup(token.Subject, groupID, requestData.AssetIDs)
     } else {
-        err = neoDB.RemoveAssetsFromGroup(token.UID, groupID, requestData.AssetIDs)
+        err = neoDB.RemoveAssetsFromGroup(token.Subject, groupID, requestData.AssetIDs)
     }
 
     if err != nil {
@@ -1405,7 +1386,7 @@ func amendGroupAssets(response http.ResponseWriter, request *http.Request, neoDB
         if !requestData.Add {
             // notify users
             var userIDs []string
-            groupUsers, err := neoDB.GetUsersInGroup(token.UID, groupID)
+            groupUsers, err := neoDB.GetUsersInGroup(token.Subject, groupID)
             if err == io.EOF {
                 return
             }
