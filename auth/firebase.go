@@ -2,10 +2,10 @@ package auth
 
 import (
 	"context"
-	"io"
 	"log"
 	"os"
 
+	"github.com/coreos/go-oidc/v3/oidc"
 	"google.golang.org/api/option"
 
 	firebase "firebase.google.com/go"
@@ -37,30 +37,40 @@ func InitialiseFirebaseAuthBackend(credentialsFilePath *string) {
 	}
 }
 
-// GetUserAuthProviders provides the authorisation mechanisms contained by the users record on firebase
-func GetUserAuthProviders(ctx context.Context, uid string) (AuthProviders, error) {
-	var authProviders AuthProviders
-	user, err := client.GetUser(ctx, uid)
-
+// AuthProvidersFromToken obtains the authorisation mechanisms from the provided
+// token. These fields are provided by Firebase.
+func AuthProvidersFromToken(idToken *oidc.IDToken) (*AuthProviders, error) {
+	authToken, err := idTokenToFirebaseAuthToken(idToken)
 	if err != nil {
-		return authProviders, err
+		return nil, err
 	}
-
-	for _, userInfo := range user.ProviderUserInfo {
-		if userInfo.ProviderID == "phone" {
-			authProviders.PhoneNumber = shasum256(userInfo.PhoneNumber)
-		}
-		if userInfo.ProviderID == "password" {
-			authProviders.Email = shasum256(userInfo.Email)
-		}
-		if userInfo.ProviderID == "apple.com" {
-			authProviders.AppleID = shasum256(userInfo.Email)
-		}
+	authProviders := AuthProviders {
+		PhoneNumber: shasum256P(identity(authToken, "phone")),
+		Email: shasum256P(identity(authToken, "email")),
+		AppleID: shasum256P(identity(authToken, "apple.com")),
 	}
+	return &authProviders, nil
+}
 
-	if authProviders == (AuthProviders{}) {
-		return authProviders, io.EOF
+// idTokenToFirebaseAuthToken transforms a generic OIDC token into a Firebase Auth token.
+func idTokenToFirebaseAuthToken(idToken *oidc.IDToken) (*firebaseAuth.Token, error) {
+    var authToken firebaseAuth.Token
+    if err := idToken.Claims(&authToken); err != nil {
+        return nil, err
+    }
+	return &authToken, nil
+}
+
+// identity obtains the identity, if available, of the given identifier key
+// from a Firebase Auth token.
+func identity(authToken *firebaseAuth.Token, identifier string) (*string) {
+	intf, ok := authToken.Firebase.Identities[identifier].([]interface{})
+	if !ok || len(intf) < 1 {
+		return nil
 	}
-
-	return authProviders, nil
+	val, ok := intf[0].(string)
+	if !ok || len(val) == 0 {
+		return nil
+	}
+	return &val
 }

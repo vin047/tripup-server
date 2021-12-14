@@ -60,7 +60,7 @@ func (neo *Neo4j) Connect() {
     }
 }
 
-func (neo *Neo4j) CreateUser(id string, uuid string, authProviders auth.AuthProviders, publickey string, privatekey string, schemaVersion string) error {
+func (neo *Neo4j) CreateUser(id string, uuid string, authProviders *auth.AuthProviders, publickey string, privatekey string, schemaVersion string) error {
     conn, err := neo.driverPool.OpenPool()
     if err != nil {
         return err
@@ -78,22 +78,12 @@ func (neo *Neo4j) CreateUser(id string, uuid string, authProviders auth.AuthProv
     args := map[string]interface{} {
         "id": id,
         "uuid": uuid,
-        "number": nil,
-        "email": nil,
-        "appleid": nil,
+        "number": authProviders.PhoneNumber,
+        "email": authProviders.Email,
+        "appleid": authProviders.AppleID,
         "publickey": publickey,
         "privatekey": privatekey,
         "schemaVersion": schemaVersion,
-    }
-
-    if len(authProviders.PhoneNumber) != 0 {
-        args["number"] = authProviders.PhoneNumber
-    }
-    if len(authProviders.Email) != 0 {
-        args["email"] = authProviders.Email
-    }
-    if len(authProviders.AppleID) != 0 {
-        args["appleid"] = authProviders.AppleID
     }
 
     // executing a statement just returns summary information
@@ -106,7 +96,7 @@ func (neo *Neo4j) CreateUser(id string, uuid string, authProviders auth.AuthProv
     return err
 }
 
-func (neo *Neo4j) UpdateUserContact(id string, authProviders auth.AuthProviders) error {
+func (neo *Neo4j) UpdateUserContact(id string, authProviders *auth.AuthProviders) error {
     conn, err := neo.driverPool.OpenPool()
     if err != nil {
         return err
@@ -115,30 +105,27 @@ func (neo *Neo4j) UpdateUserContact(id string, authProviders auth.AuthProviders)
 
     args := map[string]interface{} {
         "id": id,
-        "number": nil,
-        "email": nil,
-        "appleid": nil,
+        "number": authProviders.PhoneNumber,
+        "email": authProviders.Email,
+        "appleid": authProviders.AppleID,
     }
 
     var numberQuery string
-    if len(authProviders.PhoneNumber) != 0 {
-        args["number"] = authProviders.PhoneNumber
+    if authProviders.PhoneNumber != nil {
         numberQuery = "SET user.number = {number} "
     } else {
         numberQuery = "REMOVE user.number "
     }
 
     var emailQuery string
-    if len(authProviders.Email) != 0 {
-        args["email"] = authProviders.Email
+    if authProviders.Email != nil {
         emailQuery = "SET user.email = {email} "
     } else {
         emailQuery = "REMOVE user.email "
     }
 
     var appleIDQuery string
-    if len(authProviders.AppleID) != 0 {
-        args["appleid"] = authProviders.AppleID
+    if authProviders.AppleID != nil {
         appleIDQuery = "SET user.appleid = {appleid} "
     } else {
         appleIDQuery = "REMOVE user.appleid "

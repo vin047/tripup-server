@@ -361,7 +361,7 @@ func createUser(response http.ResponseWriter, request *http.Request, neoDB *data
         return
     }
 
-    authProviders, err := auth.GetUserAuthProviders(request.Context(), token.Subject)
+    authProviders, err := auth.AuthProvidersFromToken(token)
     if err != nil {
         response.WriteHeader(http.StatusInternalServerError)
         errLogger.Printf("Invalid auth providers – %+v\n", authProviders)
@@ -390,7 +390,7 @@ func updateUserContact(response http.ResponseWriter, request *http.Request, neoD
         return
     }
 
-    authProviders, err := auth.GetUserAuthProviders(request.Context(), token.Subject)
+    authProviders, err := auth.AuthProvidersFromToken(token)
     if err != nil {
         response.WriteHeader(http.StatusInternalServerError)
         errLogger.Printf("Invalid auth providers – %+v\n", authProviders)
