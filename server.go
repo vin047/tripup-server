@@ -30,6 +30,7 @@ var (
     errLogger           *log.Logger = log.New(os.Stderr, "[ERROR] ServerLog: ", log.LstdFlags | log.Lshortfile)
     authClient          *auth.OIDCClient
     serverStorageClient storage.StorageClient
+    firebaseClient      *auth.FirebaseClient
     notificationService notification.NotificationService
 )
 
@@ -80,12 +81,20 @@ func main() {
     }
     authClient = oidcClient
 
-    // initialize storage client
+    // initialize optional firebase client
+    firClient, err := auth.NewFirebaseClient()
+    if err == nil {
+        firebaseClient = firClient
+    } else {
+        logger.Println("firebase admin SDK not in use - ", err.Error())
+    }
+
+    // initialize optional storage client
     storageClient, err := storage.NewS3ClientFromEnv()
     if err == nil {
         serverStorageClient = storageClient
     } else {
-        logger.Print(err.Error(), "- will use STS for obtaining credentials to the storage server")
+        logger.Print("using STS for obtaining credentials to the storage server - ", err.Error())
     }
 
     // initialise notification service
@@ -102,9 +111,6 @@ func main() {
     // initialise neo4j database connection
     neoDB := database.Instance()
     neoDB.Connect()
-
-    // initialise auth backend
-    auth.InitialiseFirebaseAuthBackend(nil)
 
     // initialise the router
     router := chi.NewRouter()
