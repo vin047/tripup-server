@@ -135,6 +135,7 @@ func main() {
         subrouter.Get("/self", apiGetUUID)
         subrouter.Put("/self/contact", apiUpdateUserContact)
         subrouter.Get("/{userID}", apiGetUser)
+        subrouter.Put("/self/claims", apiSetSelfHostS3Permission)
     })
     router.Route("/assets", func(subrouter chi.Router) {
         subrouter.Use(middleware.Throttle(throttle))    // max 10 requests processed at same time, backlog others
@@ -296,6 +297,10 @@ func apiLeaveGroup(response http.ResponseWriter, request *http.Request) {
 
 func apiAmendGroupAssets(response http.ResponseWriter, request *http.Request) {
     amendGroupAssets(response, request, database.Instance())
+}
+
+func apiSetSelfHostS3Permission(response http.ResponseWriter, request *http.Request) {
+    setSelfHostS3Permission(response, request, database.Instance())
 }
 
 func GenericErrorHandler(response http.ResponseWriter) {
@@ -1406,4 +1411,27 @@ func amendGroupAssets(response http.ResponseWriter, request *http.Request, neoDB
             }
         }
     }
+}
+
+func setSelfHostS3Permission(response http.ResponseWriter, request *http.Request, neoDB *database.Neo4j) {
+    defer GenericErrorHandler(response)
+
+    if firebaseClient == nil {
+        response.WriteHeader(http.StatusNotImplemented)
+        return
+    }
+
+    token, ok := authClient.IDToken(request)
+    if !ok {
+        response.WriteHeader(http.StatusInternalServerError)
+        return
+    }
+
+    err := firebaseClient.SetSelfHostS3Claim(request.Context(), token.Subject)
+    if err != nil {
+        response.WriteHeader(http.StatusInternalServerError)
+        errLogger.Println(err.Error())
+        return
+    }
+    response.WriteHeader(http.StatusOK)
 }

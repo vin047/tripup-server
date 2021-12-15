@@ -28,6 +28,13 @@ func NewFirebaseClient() (*FirebaseClient, error) {
     return &firebaseClient, nil
 }
 
+func (client *FirebaseClient) SetSelfHostS3Claim(ctx context.Context, uid string) error {
+    claims := map[string]interface{} {
+        "policy": "readwrite",
+    }
+    return client.authClient.SetCustomUserClaims(ctx, uid, claims)
+}
+
 // AuthProvidersFromToken obtains the authorisation mechanisms from the provided
 // token. These fields are provided by Firebase.
 func AuthProvidersFromToken(idToken *oidc.IDToken) (*AuthProviders, error) {
