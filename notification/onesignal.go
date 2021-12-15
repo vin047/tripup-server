@@ -6,14 +6,27 @@ import (
 	"errors"
 	"io/ioutil"
 	"net/http"
+	"os"
 )
 
 type OneSignal struct {
-    AppID 	string
-    APIKey 	string
+    appID 	string
+    apiKey 	string
 }
 
-func (onesignal OneSignal) Notify(userIDs []string, notification Notification, additionalData *map[string]string) (error) {
+func NewOneSignalClient() (*OneSignal, error) {
+    oneSignalAppID, exists := os.LookupEnv("ONESIGNAL_APPID")
+    if !exists {
+        return nil, errors.New("ONESIGNAL_APPID missing")
+    }
+    oneSignalAPIKey, exists := os.LookupEnv("ONESIGNAL_APIKEY")
+    if !exists {
+        return nil, errors.New("ONESIGNAL_APIKEY missing")
+    }
+    return &OneSignal{appID: oneSignalAppID, apiKey: oneSignalAPIKey}, nil
+}
+
+func (oneSignal *OneSignal) Notify(userIDs []string, notification Notification, additionalData *map[string]string) (error) {
     data := map[string]string{"signal": notification.signal}
     if additionalData != nil {
         for key, value := range *additionalData {
@@ -28,7 +41,7 @@ func (onesignal OneSignal) Notify(userIDs []string, notification Notification, a
     }
 
     notificationPayload, err := json.Marshal(map[string]interface{} {
-        "app_id": onesignal.AppID,
+        "app_id": oneSignal.appID,
         "include_external_user_ids": userIDs,
         "data": data,
         "contents": contents,
@@ -43,7 +56,7 @@ func (onesignal OneSignal) Notify(userIDs []string, notification Notification, a
         return err
     }
     notificationRequest.Header.Set("Content-Type", "application/json; charset=utf-8")
-    notificationRequest.Header.Set("Authorization", "Basic " + onesignal.APIKey)
+    notificationRequest.Header.Set("Authorization", "Basic " + oneSignal.apiKey)
 
     httpClient := &http.Client{}
     notificationResponse, err := httpClient.Do(notificationRequest)

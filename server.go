@@ -97,16 +97,13 @@ func main() {
         logger.Print("using STS for obtaining credentials to the storage server - ", err.Error())
     }
 
-    // initialise notification service
-    oneSignalAppID, exists := os.LookupEnv("ONESIGNAL_APPID")
-    if !exists {
-        errLogger.Panicln("ONESIGNAL_APPID not set")
+    // initialize optional notification service
+    oneSignalClient, err := notification.NewOneSignalClient()
+    if err == nil {
+        notificationService = oneSignalClient
+    } else {
+        logger.Println("notification service not in use - ", err.Error())
     }
-    oneSignalAPIKey, exists := os.LookupEnv("ONESIGNAL_APIKEY")
-    if !exists {
-        errLogger.Panicln("ONESIGNAL_APIKEY not set")
-    }
-    notificationService = notification.OneSignal{AppID: oneSignalAppID, APIKey: oneSignalAPIKey}
 
     // initialise neo4j database connection
     neoDB := database.Instance()
@@ -502,18 +499,19 @@ func joinGroup(response http.ResponseWriter, request *http.Request, neoDB *datab
         response.WriteHeader(http.StatusCreated)
 
         // notify users
-        var userIDs []string
-        groupUsers, err := neoDB.GetUsersInGroup(token.Subject, groupID)
-        if err == io.EOF {
-            return
-        }
-        for userID := range groupUsers {
-            userIDs = append(userIDs, userID)
-        }
-        err = notificationService.Notify(userIDs, notification.UserJoinedGroup, &map[string]string{"groupid": groupID})
-        if err != nil {
-            errLogger.Println(err.Error())
-            return
+        if notificationService != nil {
+            var userIDs []string
+            groupUsers, err := neoDB.GetUsersInGroup(token.Subject, groupID)
+            if err == io.EOF {
+                return
+            }
+            for userID := range groupUsers {
+                userIDs = append(userIDs, userID)
+            }
+            err = notificationService.Notify(userIDs, notification.UserJoinedGroup, &map[string]string{"groupid": groupID})
+            if err != nil {
+                errLogger.Println(err.Error())
+            }
         }
     }
 }
@@ -595,14 +593,15 @@ func addUsersToGroup(response http.ResponseWriter, request *http.Request, neoDB 
         response.WriteHeader(http.StatusOK)
 
         // notify users
-        var userIDs []string
-        for _, user := range payload.Users {
-            userIDs = append(userIDs, user["uuid"])
-        }
-        err = notificationService.Notify(userIDs, notification.GroupInvite, nil)
-        if err != nil {
-            errLogger.Println(err.Error())
-            return
+        if notificationService != nil {
+            var userIDs []string
+            for _, user := range payload.Users {
+                userIDs = append(userIDs, user["uuid"])
+            }
+            err = notificationService.Notify(userIDs, notification.GroupInvite, nil)
+            if err != nil {
+                errLogger.Println(err.Error())
+            }
         }
     }
 }
@@ -1147,22 +1146,23 @@ func amendGroupSharedAssets(response http.ResponseWriter, request *http.Request,
         response.WriteHeader(http.StatusOK)
 
         // notify users
-        var userIDs []string
-        groupUsers, err := neoDB.GetUsersInGroup(token.Subject, groupID)
-        if err == io.EOF {
-            return
-        }
-        for userID := range groupUsers {
-            userIDs = append(userIDs, userID)
-        }
-        if requestData.Share {
-            err = notificationService.Notify(userIDs, notification.AssetsAddedToGroupByUser, &map[string]string{"groupid": groupID})
-        } else {
-            err = notificationService.Notify(userIDs, notification.AssetsChangedForGroup, &map[string]string{"groupid": groupID})
-        }
-        if err != nil {
-            errLogger.Println(err.Error())
-            return
+        if notificationService != nil {
+            var userIDs []string
+            groupUsers, err := neoDB.GetUsersInGroup(token.Subject, groupID)
+            if err == io.EOF {
+                return
+            }
+            for userID := range groupUsers {
+                userIDs = append(userIDs, userID)
+            }
+            if requestData.Share {
+                err = notificationService.Notify(userIDs, notification.AssetsAddedToGroupByUser, &map[string]string{"groupid": groupID})
+            } else {
+                err = notificationService.Notify(userIDs, notification.AssetsChangedForGroup, &map[string]string{"groupid": groupID})
+            }
+            if err != nil {
+                errLogger.Println(err.Error())
+            }
         }
     }
 }
@@ -1333,18 +1333,19 @@ func leaveGroup(response http.ResponseWriter, request *http.Request, neoDB *data
         response.WriteHeader(http.StatusOK)
 
         // notify users
-        var userIDs []string
-        groupUsers, err := neoDB.GetUsersInGroup(token.Subject, groupID)
-        if err == io.EOF {
-            return
-        }
-        for userID := range groupUsers {
-            userIDs = append(userIDs, userID)
-        }
-        err = notificationService.Notify(userIDs, notification.UserLeftGroup, &map[string]string{"groupid": groupID})
-        if err != nil {
-            errLogger.Println(err.Error())
-            return
+        if notificationService != nil {
+            var userIDs []string
+            groupUsers, err := neoDB.GetUsersInGroup(token.Subject, groupID)
+            if err == io.EOF {
+                return
+            }
+            for userID := range groupUsers {
+                userIDs = append(userIDs, userID)
+            }
+            err = notificationService.Notify(userIDs, notification.UserLeftGroup, &map[string]string{"groupid": groupID})
+            if err != nil {
+                errLogger.Println(err.Error())
+            }
         }
     }
 }
@@ -1394,7 +1395,7 @@ func amendGroupAssets(response http.ResponseWriter, request *http.Request, neoDB
     } else {
         response.WriteHeader(http.StatusOK)
 
-        if !requestData.Add {
+        if !requestData.Add && notificationService != nil {
             // notify users
             var userIDs []string
             groupUsers, err := neoDB.GetUsersInGroup(token.Subject, groupID)
